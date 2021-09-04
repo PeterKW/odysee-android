@@ -1,0 +1,2 @@
+Odysee
+gradle

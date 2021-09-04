@@ -7,7 +7,7 @@
 build/
 .idea
 .gradle
-local.properties
+#local.properties
 *.iml
 
 # BUCK
@@ -29,9 +29,9 @@ buck-out/
 
 # Other Files
 app/google-services.json
-app/twitter.properties
+#app/twitter.properties
 *.log
 .vagrant
 *.hprof
-app/build
-bin
+#app/build
+#bin
