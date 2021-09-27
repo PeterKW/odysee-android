@@ -11,6 +11,7 @@ import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.graphics.PorterDuff;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Build;
@@ -41,6 +42,7 @@ import android.widget.ProgressBar;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
 
+import androidx.annotation.AnyThread;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.widget.AppCompatSpinner;
@@ -104,12 +106,14 @@ import java.text.DecimalFormat;
 import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -118,6 +122,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import com.odysee.app.MainActivity;
 import com.odysee.app.R;
@@ -125,8 +130,10 @@ import com.odysee.app.adapter.ClaimListAdapter;
 import com.odysee.app.adapter.CommentListAdapter;
 import com.odysee.app.adapter.InlineChannelSpinnerAdapter;
 import com.odysee.app.adapter.TagListAdapter;
+import com.odysee.app.callable.Search;
 import com.odysee.app.dialog.RepostClaimDialogFragment;
 import com.odysee.app.dialog.CreateSupportDialogFragment;
+import com.odysee.app.exceptions.ApiCallException;
 import com.odysee.app.exceptions.LbryUriException;
 import com.odysee.app.exceptions.LbryioRequestException;
 import com.odysee.app.exceptions.LbryioResponseException;
@@ -147,6 +154,7 @@ import com.odysee.app.model.UrlSuggestion;
 import com.odysee.app.model.WalletBalance;
 import com.odysee.app.model.lbryinc.Reward;
 import com.odysee.app.model.lbryinc.Subscription;
+import com.odysee.app.supplier.ReactToCommentSupplier;
 import com.odysee.app.tasks.BufferEventTask;
 import com.odysee.app.tasks.CommentCreateTask;
 import com.odysee.app.tasks.CommentListHandler;
@@ -176,10 +184,12 @@ import com.odysee.app.utils.Lbry;
 import com.odysee.app.utils.LbryAnalytics;
 import com.odysee.app.utils.LbryUri;
 import com.odysee.app.utils.Lbryio;
+import com.odysee.app.utils.Predefined;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 import static com.odysee.app.utils.Lbry.TAG;
 
@@ -234,6 +244,7 @@ public class FileViewFragment extends BaseFragment implements
     private WebView webView;
     private boolean webViewAdded;
 
+    private ViewGroup singleCommentRoot;
     private ImageButton expandButton;
     private Comment replyToComment;
     private View containerReplyToComment;
@@ -289,6 +300,7 @@ public class FileViewFragment extends BaseFragment implements
         tipButton = root.findViewById(R.id.file_view_action_tip);
 
         expandButton = root.findViewById(R.id.expand_commentarea_button);
+        singleCommentRoot = root.findViewById(R.id.contracted_comment);
 
         containerCommentForm = root.findViewById(R.id.container_comment_form);
         containerReplyToComment = root.findViewById(R.id.comment_form_reply_to_container);
@@ -1284,6 +1296,14 @@ public class FileViewFragment extends BaseFragment implements
                 commentListAdapter.switchExpandedState();
             }
         });
+
+        singleCommentRoot.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                expandButton.performClick();
+            }
+        });
+
         setupInlineChannelCreator(
                 inlineChannelCreator,
                 inlineChannelCreatorInputName,
@@ -1808,54 +1828,83 @@ public class FileViewFragment extends BaseFragment implements
         }
     }
 
+    /**
+     * @return The URL to connect to get the video stream, usually a .M3U8
+     */
+    @AnyThread
     private String getLivestreamUrl() {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        Callable<JSONObject> callable = () -> {
-            String urlBitwave = String.format("https://api.bitwave.tv/v1/odysee/live/%s", claim.getSigningChannel().getClaimId());
-
-            Request.Builder builder = new Request.Builder().url(urlBitwave);
-            Request request = builder.build();
-
-            OkHttpClient client = new OkHttpClient.Builder().build();
-
-            try {
-                Response resp = client.newCall(request).execute();
-                String responseString = resp.body().string();
-                resp.close();
-                JSONObject json = new JSONObject(responseString);
-                if (resp.code() >= 200 && resp.code() < 300) {
-                    if (json.isNull("data") || (json.has("success") && !json.getBoolean("success"))) {
-                        return null;
-                    }
-                    Log.d(TAG, "getLivestreamUrl: ".concat(json.get("data").toString()));
-
-                    return (JSONObject) json.get("data");
-                } else {
-                    return null;
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.M) {
+            Supplier<JSONObject> task = new Supplier<JSONObject>() {
+                @Override
+                public JSONObject get() {
+                    return getLivestreamData(claim);
                 }
-            } catch (IOException | JSONException e) {
+            };
+            CompletableFuture<JSONObject> completableFuture = CompletableFuture.supplyAsync(task);
+            CompletableFuture<String> cf = completableFuture.thenApply(jsonData -> getLivestreamUrl(jsonData));
+            try {
+                return cf.get();
+            } catch (ExecutionException | InterruptedException e) {
                 e.printStackTrace();
-                return null;
             }
-        };
+        } else {
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            Callable<JSONObject> callable = () -> getLivestreamData(claim);
+            Future<JSONObject> future = executor.submit(callable);
 
-        Future<JSONObject> future = executor.submit(callable);
-        try {
-            JSONObject jsonData = future.get();
+            for (;;) {
+                if (future.isDone()) {
+                    try {
+                        JSONObject jsonData = future.get();
+                        return getLivestreamUrl(jsonData);
+                    } catch (InterruptedException | ExecutionException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }
+        return null;
+    }
 
-            if (jsonData != null && jsonData.has("live")) {
+    private String getLivestreamUrl(JSONObject jsonData) {
+        if (jsonData != null && jsonData.has("live")) {
+            try {
                 if (jsonData.getBoolean("live") && jsonData.has("url")) {
                     return jsonData.getString("url");
                 } else {
                     return "notlive";
                 }
-            } else {
-                return null;
+            } catch (JSONException e) {
+                e.printStackTrace();
             }
-        } catch (InterruptedException | ExecutionException | JSONException e) {
-            e.printStackTrace();
-            return null;
         }
+        return null;
+    }
+
+    private JSONObject getLivestreamData(Claim claim) {
+        String urlLivestream = String.format("https://api.live.odysee.com/v1/odysee/live/%s", claim.getSigningChannel().getClaimId());
+
+        Request.Builder builder = new Request.Builder().url(urlLivestream);
+        Request request = builder.build();
+
+        OkHttpClient client = new OkHttpClient.Builder().build();
+
+        try {
+            Response resp = client.newCall(request).execute();
+            String responseString = resp.body().string();
+            resp.close();
+            JSONObject json = new JSONObject(responseString);
+            if (resp.code() >= 200 && resp.code() < 300) {
+                if (json.isNull("data") || (json.has("success") && !json.getBoolean("success"))) {
+                    return null;
+                }
+
+                return (JSONObject) json.get("data");
+            }
+        } catch (IOException | JSONException e) {
+            e.printStackTrace();
+        }
+        return null;
     }
 
     private void setCurrentPlayer(Player currentPlayer) {
@@ -2503,7 +2552,8 @@ public class FileViewFragment extends BaseFragment implements
             Context context = getContext();
 
             List<Claim> loadingPlaceholders = new ArrayList<>();
-            for (int i = 0; i < 15; i++) {
+            int loadingPlaceholdersLength = Claim.TYPE_COLLECTION.equalsIgnoreCase(claim.getValueType()) ? claim.getClaimIds().size() : 15;
+            for (int i = 0; i < loadingPlaceholdersLength; i++) {
                 Claim placeholder = new Claim();
                 placeholder.setLoadingPlaceholder(true);
                 loadingPlaceholders.add(placeholder);
@@ -2512,8 +2562,6 @@ public class FileViewFragment extends BaseFragment implements
             RecyclerView relatedContentList = root.findViewById(R.id.file_view_related_content_list);
             relatedContentList.setAdapter(relatedContentAdapter);
 
-            String title = claim.getTitle();
-            String claimId = claim.getClaimId();
             ProgressBar relatedLoading = root.findViewById(R.id.file_view_related_content_progress);
             boolean canShowMatureContent = false;
             if (context != null) {
@@ -2521,20 +2569,86 @@ public class FileViewFragment extends BaseFragment implements
                 canShowMatureContent = sp.getBoolean(MainActivity.PREFERENCE_KEY_SHOW_MATURE_CONTENT, false);
             }
 
-            LighthouseSearchTask relatedTask = new LighthouseSearchTask(
-                    title, RELATED_CONTENT_SIZE, 0, canShowMatureContent, claimId, relatedLoading, new ClaimSearchResultHandler() {
-                @Override
-                public void onSuccess(List<Claim> claims, boolean hasReachedEnd) {
-                    List<Claim> filteredClaims = new ArrayList<>();
-                    for (Claim c : claims) {
-                        if (!c.getClaimId().equalsIgnoreCase(claim.getClaimId())) {
-                            filteredClaims.add(c);
+            if (!Claim.TYPE_COLLECTION.equalsIgnoreCase(claim.getValueType())) {
+                String title = claim.getTitle();
+                String claimId = claim.getClaimId();
+
+                LighthouseSearchTask relatedTask = new LighthouseSearchTask(
+                        title, RELATED_CONTENT_SIZE, 0, canShowMatureContent, claimId, relatedLoading, new ClaimSearchResultHandler() {
+                    @Override
+                    public void onSuccess(List<Claim> claims, boolean hasReachedEnd) {
+                        List<Claim> filteredClaims = new ArrayList<>();
+                        for (Claim c : claims) {
+                            if (!c.getClaimId().equalsIgnoreCase(claim.getClaimId())) {
+                                filteredClaims.add(c);
+                            }
+                        }
+
+                        Context ctx = getContext();
+                        if (ctx != null) {
+                            relatedContentAdapter.setItems(filteredClaims);
+                            relatedContentAdapter.setListener(new ClaimListAdapter.ClaimListItemListener() {
+                                @Override
+                                public void onClaimClicked(Claim claim) {
+                                    if (claim.isLoadingPlaceholder()) {
+                                        return;
+                                    }
+
+                                    if (context instanceof MainActivity) {
+                                        MainActivity activity = (MainActivity) context;
+                                        if (claim.getName().startsWith("@")) {
+                                            activity.openChannelClaim(claim);
+                                        } else {
+                                            activity.openFileUrl(claim.getPermanentUrl()); //openClaimUrl(claim.getPermanentUrl());
+                                        }
+                                    }
+                                }
+                            });
+
+                            View v = getView();
+                            if (v != null) {
+                                RecyclerView relatedContentList = root.findViewById(R.id.file_view_related_content_list);
+                                relatedContentList.setAdapter(relatedContentAdapter);
+                                relatedContentAdapter.notifyDataSetChanged();
+
+                                Helper.setViewVisibility(
+                                        v.findViewById(R.id.file_view_no_related_content),
+                                        relatedContentAdapter == null || relatedContentAdapter.getItemCount() == 0 ? View.VISIBLE : View.GONE);
+                            }
+
+                            // if related content loads before comment, this will affect the scroll position
+                            // so just ensure that we are at the correct position
+                            scrollToCommentHash();
                         }
                     }
 
-                    Context ctx = getContext();
-                    if (ctx != null) {
-                        relatedContentAdapter.setItems(filteredClaims);
+                    @Override
+                    public void onError(Exception error) {
+
+                    }
+                });
+                relatedTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+            } else {
+                TextView relatedOrPlayList = root.findViewById(R.id.related_or_playlist);
+                relatedOrPlayList.setText(claim.getTitle());
+                relatedOrPlayList.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_cast_connected, 0, 0, 0);
+                relatedOrPlayList.setPadding(0, 0, 0, 16);
+                relatedOrPlayList.setTypeface(null, Typeface.BOLD);
+
+                Map<String, Object> claimSearchOptions = new HashMap<>(3);
+
+                claimSearchOptions.put("claim_ids", claim.getClaimIds());
+                claimSearchOptions.put("not_tags", canShowMatureContent ? null : new ArrayList<>(Predefined.MATURE_TAGS));
+                claimSearchOptions.put("page_size", claim.getClaimIds().size());
+
+                ExecutorService executor = Executors.newSingleThreadExecutor();
+                Future<List<Claim>> future = executor.submit(new Search(claimSearchOptions));
+
+                try {
+                    List<Claim> playlistClaimItems = future.get();
+
+                    if (playlistClaimItems != null) {
+                        relatedContentAdapter.setItems(playlistClaimItems);
                         relatedContentAdapter.setListener(new ClaimListAdapter.ClaimListItemListener() {
                             @Override
                             public void onClaimClicked(Claim claim) {
@@ -2544,18 +2658,13 @@ public class FileViewFragment extends BaseFragment implements
 
                                 if (context instanceof MainActivity) {
                                     MainActivity activity = (MainActivity) context;
-                                    if (claim.getName().startsWith("@")) {
-                                        activity.openChannelClaim(claim);
-                                    } else {
-                                        activity.openFileUrl(claim.getPermanentUrl()); //openClaimUrl(claim.getPermanentUrl());
-                                    }
+                                    activity.openFileUrl(claim.getPermanentUrl()); //openClaimUrl(claim.getPermanentUrl());
                                 }
                             }
                         });
 
                         View v = getView();
                         if (v != null) {
-                            RecyclerView relatedContentList = root.findViewById(R.id.file_view_related_content_list);
                             relatedContentList.setAdapter(relatedContentAdapter);
                             relatedContentAdapter.notifyDataSetChanged();
 
@@ -2564,18 +2673,12 @@ public class FileViewFragment extends BaseFragment implements
                                     relatedContentAdapter == null || relatedContentAdapter.getItemCount() == 0 ? View.VISIBLE : View.GONE);
                         }
 
-                        // if related content loads before comment, this will affect the scroll position
-                        // so just ensure that we are at the correct position
                         scrollToCommentHash();
                     }
+                } catch (InterruptedException | ExecutionException e) {
+                    e.printStackTrace();
                 }
-
-                @Override
-                public void onError(Exception error) {
-
-                }
-            });
-            relatedTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+            }
         }
     }
 
@@ -2586,6 +2689,41 @@ public class FileViewFragment extends BaseFragment implements
             CommentListTask task = new CommentListTask(1, 200, claim.getClaimId(), commentsLoading, new CommentListHandler() {
                 @Override
                 public void onSuccess(List<Comment> comments, boolean hasReachedEnd) {
+                    Comment singleComment = comments.get(0);
+
+                    TextView commentText = singleCommentRoot.findViewById(R.id.comment_text);
+                    ImageView thumbnailView = singleCommentRoot.findViewById(R.id.comment_thumbnail);
+                    View noThumbnailView = singleCommentRoot.findViewById(R.id.comment_no_thumbnail);
+                    TextView alphaView = singleCommentRoot.findViewById(R.id.comment_thumbnail_alpha);
+
+                    commentText.setText(singleComment.getText());
+                    commentText.setMaxLines(3);
+                    commentText.setEllipsize(TextUtils.TruncateAt.END);
+                    commentText.setClickable(true);
+                    commentText.setTextIsSelectable(false);
+
+                    boolean hasThumbnail = singleComment.getPoster() != null && !Helper.isNullOrEmpty(singleComment.getPoster().getThumbnailUrl());
+                    thumbnailView.setVisibility(hasThumbnail ? View.VISIBLE : View.INVISIBLE);
+                    noThumbnailView.setVisibility(!hasThumbnail ? View.VISIBLE : View.INVISIBLE);
+
+                    int bgColor = Helper.generateRandomColorForValue(singleComment.getChannelId());
+                    Helper.setIconViewBackgroundColor(noThumbnailView, bgColor, false, getContext());
+                    if (hasThumbnail) {
+                        Glide.with(getContext().getApplicationContext()).asBitmap().load(singleComment.getPoster().getThumbnailUrl()).
+                                apply(RequestOptions.circleCropTransform()).into(thumbnailView);
+                    }
+                    alphaView.setText(singleComment.getChannelName() != null ? singleComment.getChannelName().substring(1, 2).toUpperCase() : null);
+                    singleCommentRoot.findViewById(R.id.comment_actions_area).setVisibility(View.GONE);
+                    singleCommentRoot.findViewById(R.id.comment_time).setVisibility(View.GONE);
+                    singleCommentRoot.findViewById(R.id.comment_channel_name).setVisibility(View.GONE);
+
+                    singleCommentRoot.setOnClickListener(new View.OnClickListener() {
+                        @Override
+                        public void onClick(View v) {
+                            expandButton.performClick();
+                        }
+                    });
+
                     Map<String, Reactions> commentReactions = loadReactions(comments);
 
                     if (commentReactions != null) {
@@ -2623,7 +2761,7 @@ public class FileViewFragment extends BaseFragment implements
 
                         RecyclerView commentsList = root.findViewById(R.id.file_view_comments_list);
                         commentsList.setAdapter(commentListAdapter);
-                        commentListAdapter.notifyDataSetChanged();
+                        commentListAdapter.notifyItemRangeInserted(0, comments.size());
 
                         scrollToCommentHash();
                         checkNoComments();
@@ -2661,6 +2799,8 @@ public class FileViewFragment extends BaseFragment implements
             Helper.setViewVisibility(root.findViewById(R.id.file_view_no_comments),
                     commentListAdapter == null || commentListAdapter.getItemCount() == 0 ? View.VISIBLE : View.GONE);
             Helper.setViewVisibility(root.findViewById(R.id.expand_commentarea_button),
+                    commentListAdapter == null || commentListAdapter.getItemCount() == 0 ? View.GONE : View.VISIBLE);
+            Helper.setViewVisibility(root.findViewById(R.id.contracted_comment),
                     commentListAdapter == null || commentListAdapter.getItemCount() == 0 ? View.GONE : View.VISIBLE);
 
             if (commentListAdapter == null)
@@ -3408,7 +3548,7 @@ public class FileViewFragment extends BaseFragment implements
     }
 
     @SuppressLint("UseCompatLoadingForDrawables")
-    private void switchCommentListVisibility(Boolean isExpanded) {
+    private void switchCommentListVisibility(Boolean expanded) {
         View root = getView();
         View relatedContentArea = root.findViewById(R.id.file_view_related_content_area);
         View actionsArea = root.findViewById(R.id.file_view_actions_area);
@@ -3416,7 +3556,8 @@ public class FileViewFragment extends BaseFragment implements
         ImageButton expandButton = root.findViewById(R.id.expand_commentarea_button);
         Context context = getContext();
 
-        if (isExpanded) {
+        if (expanded) {
+            root.findViewById(R.id.contracted_comment).setVisibility(View.GONE);
             Helper.setViewVisibility(containerCommentForm, View.VISIBLE);
             Helper.setViewVisibility(relatedContentArea, View.GONE);
             Helper.setViewVisibility(actionsArea, View.GONE);
@@ -3425,6 +3566,7 @@ public class FileViewFragment extends BaseFragment implements
                 expandButton.setImageDrawable(getResources().getDrawable(R.drawable.ic_close, context.getTheme()));
         } else {
             Helper.setViewVisibility(containerCommentForm, View.GONE);
+            root.findViewById(R.id.contracted_comment).setVisibility(View.VISIBLE);
             Helper.setViewVisibility(relatedContentArea, View.VISIBLE);
             Helper.setViewVisibility(actionsArea, View.VISIBLE);
             Helper.setViewVisibility(publisherArea, View.VISIBLE);
@@ -3483,11 +3625,8 @@ public class FileViewFragment extends BaseFragment implements
     }
 
     private void react(Comment comment, boolean like) {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-
-        Callable<Boolean> callable = () -> {
-            Comments.checkCommentsEndpointStatus();
-            JSONObject options = new JSONObject();
+        JSONObject options = new JSONObject();
+        try {
             options.put("comment_ids", comment.getId());
             options.put("type", like ? "like" : "dislike");
             options.put("clear_types", like ? "dislike" : "like");
@@ -3499,54 +3638,100 @@ public class FileViewFragment extends BaseFragment implements
             if (am.getAccounts().length > 0) {
                 options.put("auth_token", am.peekAuthToken(am.getAccounts()[0], "auth_token_type"));
             }
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
 
-            if (Lbry.ownChannels.size() > 0) {
-                options.put("channel_id", Lbry.ownChannels.get(0).getClaimId());
-                options.put("channel_name", Lbry.ownChannels.get(0).getName());
-
-                JSONObject jsonChannelSign = Comments.channelSign(options, options.getString("channel_id"), options.getString("channel_name"));
-
-                if (jsonChannelSign.has("signature") && jsonChannelSign.has("signing_ts")) {
-                    options.put("signature", jsonChannelSign.getString("signature"));
-                    options.put("signing_ts", jsonChannelSign.getString("signing_ts"));
+        AccountManager am = AccountManager.get(getContext());
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.M) {
+            Supplier<Boolean> task = new ReactToCommentSupplier(am, options);
+            CompletableFuture<Boolean> completableFuture = CompletableFuture.supplyAsync(task);
+            completableFuture.thenAccept(result -> {
+                if (result) {
+                    refreshCommentAfterReacting(comment);
                 }
-            }
+            });
+        } else {
+            Thread thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    // This makes a network connection, so it needs to be executed on a different thread than main.
+                    if (Lbry.ownChannels.size() > 0) {
+                        try {
+                            options.put("channel_id", Lbry.ownChannels.get(0).getClaimId());
+                            options.put("channel_name", Lbry.ownChannels.get(0).getName());
+                            JSONObject jsonChannelSign = Comments.channelSign(options, options.getString("channel_id"), options.getString("channel_name"));
 
-            JSONObject data = null;
-            try {
-                if (am.getAccounts().length > 0) {
-                    okhttp3.Response response = Comments.performRequest(options, "reaction.React");
-                    String responseString = response.body().string();
-                    response.close();
+                            if (jsonChannelSign.has("signature") && jsonChannelSign.has("signing_ts")) {
+                                options.put("signature", jsonChannelSign.getString("signature"));
+                                options.put("signing_ts", jsonChannelSign.getString("signing_ts"));
+                            }
+                        } catch (JSONException | ApiCallException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    Callable<Boolean> callable = new Callable<Boolean>() {
+                        @Override
+                        public Boolean call() {
+                            JSONObject data = null;
+                            try {
+                                if (am.getAccounts().length > 0) {
+                                    okhttp3.Response response = Comments.performRequest(options, "reaction.React");
 
-                    JSONObject jsonResponse = new JSONObject(responseString);
+                                    ResponseBody responseBody = response.body();
 
-                    if (jsonResponse.has("result")) {
-                        data = jsonResponse.getJSONObject("result");
-                    } else {
-                        Log.e("ReactingToComment", jsonResponse.getJSONObject("error").getString("message"));
+                                    if (responseBody != null) {
+                                        String responseString = responseBody.string();
+
+                                        JSONObject jsonResponse = new JSONObject(responseString);
+
+                                        if (jsonResponse.has("result")) {
+                                            data = jsonResponse.getJSONObject("result");
+                                        } else {
+                                            Log.e("ReactingToComment", jsonResponse.getJSONObject("error").getString("message"));
+                                        }
+                                    }
+                                    response.close();
+                                }
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+                            return data != null && !data.has("error");
+                        }
+                    };
+                    Future<Boolean> futureReactions = executor.submit(callable);
+                    Boolean result;
+                    try {
+                        // This runs on a different thread, so it will not block main thread
+                        result = futureReactions.get();
+                        if (result) {
+                            refreshCommentAfterReacting(comment);
+                        }
+                    } catch (InterruptedException | ExecutionException e) {
+                        e.printStackTrace();
                     }
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "react: ".concat(e.getLocalizedMessage()));
-                e.printStackTrace();
+            });
+
+            thread.start();
+        }
+    }
+
+    private void refreshCommentAfterReacting(Comment comment) {
+        Map<String, Reactions> reactionsList = loadReactions(Collections.singletonList(comment));
+
+        if (reactionsList != null && reactionsList.containsKey(comment.getId())){
+            Activity activity = getActivity();
+
+            if (activity != null) {
+                activity.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        commentListAdapter.updateReactions(comment, reactionsList.get(comment.getId()));
+                    }
+                });
             }
-            return data != null && !data.has("error");
-        };
-
-        Future<Boolean> futureReactions = executor.submit(callable);
-
-        Boolean result;
-
-        try {
-            result = futureReactions.get();
-            if (result) {
-              expandButton.performClick();
-              scrollView.scrollTo(0, 0);
-              checkAndLoadComments(true);
-            }
-        } catch (InterruptedException | ExecutionException e) {
-            e.printStackTrace();
         }
     }
 

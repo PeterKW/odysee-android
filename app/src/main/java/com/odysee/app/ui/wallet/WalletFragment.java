@@ -7,11 +7,11 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -56,19 +56,21 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Supplier;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 import com.odysee.app.MainActivity;
 import com.odysee.app.R;
-import com.odysee.app.SignInActivity;
 import com.odysee.app.adapter.TransactionListAdapter;
 import com.odysee.app.adapter.WalletDetailAdapter;
+import com.odysee.app.supplier.WalletGetUnusedAddressSupplier;
 import com.odysee.app.callable.WalletGetUnusedAddress;
 import com.odysee.app.exceptions.ApiCallException;
 import com.odysee.app.listener.WalletBalanceListener;
@@ -114,7 +116,6 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
     private TextView textWalletReceiveAddress;
     private TextView textWalletHintSyncStatus;
     private ImageButton buttonCopyReceiveAddress;
-    private MaterialButton buttonGetNewAddress;
     private TextInputEditText inputSendAddress;
     private TextInputEditText inputSendAmount;
     private MaterialButton buttonSend;
@@ -285,11 +286,6 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
         itemDecoration.setDrawable(ContextCompat.getDrawable(context, R.drawable.thin_divider));
         recentTransactionsList.addItemDecoration(itemDecoration);
 
-        detailRows = new ArrayList<>(3);
-
-        detailAdapter = new WalletDetailAdapter(context, detailRows);
-        detailListView.setAdapter(detailAdapter);
-
         buttonViewMore.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -298,6 +294,21 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
                     View walletDetail = ((MainActivity) context).findViewById(R.id.balance_detail_listview);
 
                     if (walletDetail.getVisibility() == View.GONE) {
+                        int listHeight = Math.round(getResources().getDisplayMetrics().density);
+
+                        for (int i = 0; i < detailRows.size(); i++) {
+                            View item = detailAdapter.getView(i, null, detailListView);
+                            item.measure(0, 0);
+                            listHeight += item.getMeasuredHeight();
+                        }
+
+                        // Avoid scroll bars being displayed
+                        ViewGroup.LayoutParams params = detailListView.getLayoutParams();
+                        params.height = listHeight + (detailListView.getCount() + 1) * detailListView.getDividerHeight();
+                        detailListView.setLayoutParams(params);
+                        detailListView.setVerticalScrollBarEnabled(false);
+                        detailListView.requestLayout();
+
                         TransitionManager.beginDelayedTransition((ViewGroup) walletDetail.getParent());
                         walletDetail.setVisibility(View.VISIBLE);
                         buttonViewMore.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, R.drawable.ic_arrow_dropup, 0);
@@ -602,6 +613,7 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
             if (!activity.isSignedIn()) {
                 activity.simpleSignIn(R.id.action_wallet_menu);
             }
+            activity.addWalletBalanceListener(this);
         }
     }
 
@@ -615,31 +627,50 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
     }
 
     public void generateNewAddress() {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-
-        Callable<String> callable = new WalletGetUnusedAddress(getContext());
-
-        // TODO: calling future.get blocks the UI thread. Need to fix.
-        Future<String> future = executor.submit(callable);
-
-        try {
-            Helper.setViewEnabled(buttonGetNewAddress, false);
-
-            String addr = future.get();
-
-            if (!Helper.isNullOrEmpty(addr)) {
-                Context context = getContext();
-                if (context != null) {
-                    SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(context);
-                    sp.edit().putString(MainActivity.PREFERENCE_KEY_INTERNAL_WALLET_RECEIVE_ADDRESS, addr).apply();
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.M) {
+            AccountManager am = AccountManager.get(getContext());
+            Supplier<String> task = new WalletGetUnusedAddressSupplier(am.peekAuthToken(am.getAccounts()[0], "auth_token_type"));
+            CompletableFuture<String> completableFuture = CompletableFuture.supplyAsync(task);
+            completableFuture.thenAccept(addr -> {
+                if (!Helper.isNullOrEmpty(addr)) {
+                    Context context = getContext();
+                    if (context != null) {
+                        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(context);
+                        sp.edit().putString(MainActivity.PREFERENCE_KEY_INTERNAL_WALLET_RECEIVE_ADDRESS, addr).apply();
+                    }
+                    Helper.setViewText(textWalletReceiveAddress, addr);
                 }
-                Helper.setViewText(textWalletReceiveAddress, addr);
-                Helper.setViewEnabled(buttonGetNewAddress, true);
-            } else {
-                Helper.setViewEnabled(buttonGetNewAddress, true);
-            }
-        } catch (InterruptedException | ExecutionException e) {
-            e.printStackTrace();
+            });
+        } else {
+            Thread thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    Callable<String> callable = new WalletGetUnusedAddress(getContext());
+                    Future<String> future = executor.submit(callable);
+                    try {
+                        String addr = future.get();
+
+                        if (!Helper.isNullOrEmpty(addr)) {
+                            Context context = getContext();
+                            if (context != null) {
+                                SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(context);
+                                sp.edit().putString(MainActivity.PREFERENCE_KEY_INTERNAL_WALLET_RECEIVE_ADDRESS, addr).apply();
+                                ((MainActivity)context).runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        Helper.setViewText(textWalletReceiveAddress, addr);
+                                    }
+                                });
+                            }
+                        }
+                    } catch (InterruptedException | ExecutionException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+
+            thread.start();
         }
     }
 
@@ -670,55 +701,25 @@ public class WalletFragment extends BaseFragment implements WalletBalanceListene
         WalletDetailItem initialPublishes = new WalletDetailItem(getResources().getString(R.string.on_initial_publishes), getResources().getString(R.string.delete_or_edit_past_content), Helper.SIMPLE_CURRENCY_FORMAT.format(walletBalance.getClaims().doubleValue()), false, false);
         WalletDetailItem supportingContent = new WalletDetailItem(getResources().getString(R.string.supporting_content), getResources().getString(R.string.delete_supports_to_spend), Helper.SIMPLE_CURRENCY_FORMAT.format(walletBalance.getSupports().doubleValue()), false, false);
 
-        boolean needNotifyAdapter = false;
-        boolean firstDatasetNotification;
-
         if (detailRows.size() == 0) {
             detailRows.add(0, earnedBalance);
             detailRows.add(1, initialPublishes);
             detailRows.add(2, supportingContent);
-            needNotifyAdapter = true;
-            firstDatasetNotification = true;
         } else {
-            firstDatasetNotification = false;
             if (!detailRows.get(0).detailAmount.equals(earnedBalance.detailAmount)
                  || detailRows.get(0).isInProgress != earnedBalance.isInProgress
                  || detailRows.get(0).isUnlockable != earnedBalance.isUnlockable) {
                 detailRows.set(0, earnedBalance);
-                needNotifyAdapter = true;
             }
             if (!detailRows.get(1).detailAmount.equals(initialPublishes.detailAmount)) {
                 detailRows.set(1, initialPublishes);
-                needNotifyAdapter = true;
             }
             if (!detailRows.get(2).detailAmount.equals(supportingContent.detailAmount)) {
                 detailRows.set(2, supportingContent);
-                needNotifyAdapter = true;
             }
         }
 
-        if (needNotifyAdapter) {
-            // notifyDatasetChanged() doesn't work, so simply reset the adapter to the list
-            // to update the view
-            detailListView.setAdapter(detailAdapter);
-
-            if (firstDatasetNotification) {
-                int listHeight = Math.round(getResources().getDisplayMetrics().density);
-
-                for (int i = 0; i < detailRows.size(); i++) {
-                    View item = detailAdapter.getView(i, null, detailListView);
-                    item.measure(0, 0);
-                    listHeight += item.getMeasuredHeight();
-                }
-
-                // Avoid scroll bars being displayed
-                ViewGroup.LayoutParams params = detailListView.getLayoutParams();
-                params.height = listHeight + (detailListView.getCount() + 1) * detailListView.getDividerHeight();
-                detailListView.setLayoutParams(params);
-                detailListView.setVerticalScrollBarEnabled(false);
-                detailListView.requestLayout();
-            }
-        }
+        detailListView.setAdapter(detailAdapter);
 
         String formattedTotalBalance = Helper.REDUCED_LBC_CURRENCY_FORMAT.format(totalBalance);
         String formattedSpendableBalance = Helper.SIMPLE_CURRENCY_FORMAT.format(spendableBalance);

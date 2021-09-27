@@ -490,9 +490,9 @@ public final class Lbry {
                     // Livestreams don't have a source set. Then request a livestream URL only for
                     // audio and video, even for reposted claims
                     if (!claim.hasSource() && claim.getSigningChannel() != null) {
-                        String urlBitwave = String.format("https://api.bitwave.tv/v1/odysee/live/%s", claim.getSigningChannel().getClaimId());
+                        String urlLivestream = String.format("https://api.live.odysee.com/v1/odysee/live/%s", claim.getSigningChannel().getClaimId());
 
-                        Request.Builder builder = new Request.Builder().url(urlBitwave);
+                        Request.Builder builder = new Request.Builder().url(urlLivestream);
                         Request request = builder.build();
 
                         OkHttpClient client = new OkHttpClient.Builder().build();
@@ -517,8 +517,10 @@ public final class Lbry {
 
                     }
 
-                    // For now, only claims which are audio, videos or livestreaming right now can be viewed
-                    if (Claim.TYPE_REPOST.equalsIgnoreCase(claim.getValueType()) || (!claim.hasSource() && claim.isLive()) || (claim.hasSource() && (claim.getMediaType().contains("video") || claim.getMediaType().contains("audio"))))
+                    // For now, only claims which are audio, videos, playlists or livestreaming right now can be viewed
+                    if (Claim.TYPE_REPOST.equalsIgnoreCase(claim.getValueType()) || Claim.TYPE_COLLECTION.equalsIgnoreCase(claim.getValueType())
+                        || (!claim.hasSource() && claim.isLive())
+                        || (claim.hasSource() && (claim.getMediaType().contains("video") || claim.getMediaType().contains("audio"))))
                         claims.add(claim);
 
                     addClaimToCache(claim);

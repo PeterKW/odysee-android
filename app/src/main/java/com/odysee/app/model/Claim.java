@@ -1,10 +1,13 @@
 package com.odysee.app.model;
 
+import android.annotation.SuppressLint;
+
 import com.google.gson.FieldNamingPolicy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -14,6 +17,7 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 
 import com.odysee.app.utils.Helper;
@@ -32,6 +36,7 @@ public class Claim {
     public static final String TYPE_STREAM = "stream";
     public static final String TYPE_CHANNEL = "channel";
     public static final String TYPE_REPOST = "repost";
+    public static final String TYPE_COLLECTION = "collection";
 
     public static final String STREAM_TYPE_AUDIO = "audio";
     public static final String STREAM_TYPE_IMAGE = "image";
@@ -90,6 +95,9 @@ public class Claim {
 
     private boolean isLive;
     private String livestreamUrl;
+
+    // Collections
+    private List<String> claimIds;
 
     public static Claim claimFromOutput(JSONObject item) {
         // we only need name, permanent_url, txid and nout
@@ -340,16 +348,26 @@ public class Claim {
                         claim.setValue(gson.fromJson(valueJson, streamMetadataType));
                     } else if (TYPE_CHANNEL.equalsIgnoreCase(valueType)) {
                         claim.setValue(gson.fromJson(valueJson, channelMetadataType));
+                    } else if (TYPE_COLLECTION.equalsIgnoreCase(valueType)) {
+                        JSONArray claims = value.getJSONArray("claims");
+                        List<String> ids = new ArrayList<>(claims.length());
+
+                        for (int i = 0; i < claims.length(); i++) {
+                            ids.add(claims.getString(i));
+                        }
+                        claim.setClaimIds(ids);
                     }
                 }
             }
         } catch (JSONException ex) {
+            ex.printStackTrace();
             // pass
         }
 
         return claim;
     }
 
+    @SuppressLint("SimpleDateFormat")
     public static Claim fromSearchJSONObject(JSONObject searchResultObject) {
         Claim claim = new Claim();
         LbryUri claimUri = new LbryUri();
@@ -365,7 +383,7 @@ public class Claim {
             } else {
                 claimUri.setStreamClaimId(claim.getClaimId());
                 claimUri.setStreamName(claim.getName());
-                claim.setValueType(TYPE_STREAM);
+                claim.setValueType((!searchResultObject.isNull("value_type") && searchResultObject.getString("value_type").equalsIgnoreCase("collection")) ? TYPE_COLLECTION : TYPE_STREAM);
             }
 
             int duration = searchResultObject.isNull("duration") ? 0 : searchResultObject.getInt("duration");
@@ -373,7 +391,13 @@ public class Claim {
             String releaseTimeString = !searchResultObject.isNull("release_time") ? searchResultObject.getString("release_time") : null;
             long releaseTime = 0;
             try {
-                releaseTime = Double.valueOf(new SimpleDateFormat(RELEASE_TIME_DATE_FORMAT).parse(releaseTimeString).getTime() / 1000.0).longValue();
+                if (releaseTimeString != null) {
+                    Date releaseTimeAsDate = new SimpleDateFormat(RELEASE_TIME_DATE_FORMAT).parse(releaseTimeString);
+
+                    if (releaseTimeAsDate!= null) {
+                        releaseTime = Double.valueOf(releaseTimeAsDate.getTime() / 1000.0).longValue();
+                    }
+                }
             } catch (ParseException ex) {
                 // pass
             }
